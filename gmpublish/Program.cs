@@ -1,6 +1,6 @@
 ﻿using GMPublish.LZMA;
 using Ionic.Zip;
-using GMPublish.GMAD;
+using Newtonsoft.Json;
 using SteamKit2;
 using SteamKit2.Unified.Internal;
 using System;
@@ -9,6 +9,8 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+
+using GMPublish.GMAD;
 
 namespace GMPublish
 {
@@ -23,26 +25,71 @@ namespace GMPublish
 
         static bool isRunning;
 
+        // Authentication shit
         static string user, pass;
         static string authCode, twoFactorAuth;
+        static Action currentAction;
+
+        // The type of actions i.e gmpublish create -addon some.gma -icon i.jpg => CREATE command
+        enum Action { CREATE, UPDATE, LIST };
+
+        // Runtime variables set by command arguments or environment variables
+        // Some are only set for certain command types
+
+        // FileInfo for commands using the -addon and/or -icon arguments
+        static FileInfo gmaFile, iconFile;
+
+        // For updates this is the id of the existing workshop item
+        static int workshopId;
+
+      
 
         public static readonly uint APPID = 4000;
 
         public static void Main(string[] args)
         {
-            //DebugLog.AddListener((level, msg) =>
+
+            //if (args.Length < 2)
             //{
-            //    Console.WriteLine("[{0}] {1}", level, msg);
-            //});
+            //    Console.WriteLine("GMPublish: No username and password specified!");
+            //    return;
+            //}
 
-            if (args.Length < 2)
-            {
-                Console.WriteLine("GMPublish: No username and password specified!");
-                return;
+            //user = args[0];
+            //pass = args[1];
+
+            string gmaFilePath, iconFilePath;
+            switch (args[0]) {
+                case "create":
+                    currentAction = Action.CREATE;
+
+                    gmaFilePath = FindArgumentValue("-addon", args, true);
+                    gmaFile = GetFileInfoOrExit(gmaFilePath);
+
+                    iconFilePath = FindArgumentValue("-icon", args, true);
+                    iconFile = GetFileInfoOrExit(iconFilePath);
+                    break;
+                case "update":
+                    currentAction = Action.UPDATE;
+
+                    gmaFilePath = FindArgumentValue("-addon", args, true);
+                    gmaFile = GetFileInfoOrExit(gmaFilePath);
+
+                    workshopId = int.Parse(FindArgumentValue("-id", args, true));
+                   
+                    iconFilePath = FindArgumentValue("-icon", args, false);
+                    if(iconFilePath != null)
+                        iconFile = GetFileInfoOrExit(iconFilePath);
+                    break;
+                case "list":
+                    currentAction = Action.LIST;
+                    break;
+                default:
+                    Console.WriteLine("Invalid command please use either create, update or list");
+                    Exit(8);
+                    break;
+
             }
-
-            user = args[0];
-            pass = args[1];
 
             SteamDirectory.Initialize().Wait();
 
@@ -68,6 +115,52 @@ namespace GMPublish
             Console.ReadLine();
         }
 
+        // Searches through the arguments for the argName and then subsequently looks for a proceeding value. 
+        // GMPublish only accepts arguments in the format -arg <space> <value> so that is all this will support. No -arg=vaue or -argvalue
+        // if required is set we will exit if the value is not found
+        static string FindArgumentValue(string argName, string[] args, bool required = false){
+            // Skip the first argument because that is the verb and itterate over the rest in pairs
+            for (int i = 1; i < args.Length - 1; i++){
+                if(args[i] == argName){
+                    return args[i + 1];
+                }
+            }
+            if (required){
+                Console.WriteLine("Error: argument " + argName + " is required!");
+                Exit(8);
+            }
+            return null;
+        }
+
+        static FileInfo GetFileInfoOrExit(string path){
+            var fileinfo = new FileInfo(path);
+            if (!fileinfo.Exists){
+                Console.WriteLine("Error: File " + path + " not found!");
+                Exit(9);
+            }
+            return fileinfo;
+        }
+
+        static void Exit(int code){System.Environment.Exit(code);}
+
+        struct AddonInfo
+        {
+            public string title;
+            public DescriptionJSON description;
+        }
+
+        static AddonInfo GetAddonInfoFromGMAFile(Stream gmaStream){
+            AddonInfo addonInfo;
+            using (BinaryReader binaryReader = new BinaryReader(gmaStream)){
+                // Skip past the first part of the gma header to get to the title and description the first entry sizes are 4, 1, 8, 8, 1, then title and description
+                gmaStream.Seek(23, SeekOrigin.Begin);
+
+                addonInfo.title = binaryReader.ReadNullTerminatedString();
+                addonInfo.description = JsonConvert.DeserializeObject<DescriptionJSON>(binaryReader.ReadNullTerminatedString());
+            }
+            return addonInfo;
+        }
+
         static byte[] SHAHash(Stream stream)
         {
 
@@ -80,93 +173,97 @@ namespace GMPublish
             }
         }
 
+        static async Task UploadIcon(Stream iconStream){
+            var hash = SHAHash(iconStream);
+            var iconSuccess = await CloudStream.UploadStream("gmpublish_icon.jpg", APPID, hash, iconStream.Length, steamClient, iconStream);
+            if (!iconSuccess) { 
+                Console.WriteLine("JPG Upload failed");
+                Exit(32);
+            }
+        }
+
+        static async Task UploadAddonGMA(Stream gmaStream)
+        {
+            var lzmaStream = LZMAEncodeStream.CompressStreamLZMA(gmaStream);
+            var hashGma = SHAHash(lzmaStream);
+            var gmaSuccess = await CloudStream.UploadStream("gmpublish.gma", APPID, hashGma, lzmaStream.Length, steamClient, lzmaStream);
+            if (!gmaSuccess) { 
+                Console.WriteLine("GMA Upload failed"); 
+                Exit(32);
+            }
+        }
+
         static void FullyLoggedIn(SteamUser.LoggedOnCallback callback)
         {
             var task = Task.Run(async () =>
             {
                 try
                 {
-                    await CloudStream.DeleteFile("gmpublish_icon.jpg", APPID, steamClient);
-                    await CloudStream.DeleteFile("gmpublish.gma", APPID, steamClient);
+                    if(currentAction == Action.CREATE || currentAction == Action.UPDATE) {
+                        // Delete any previously uploaded temp files
+                        await CloudStream.DeleteFile("gmpublish_icon.jpg", APPID, steamClient);
+                        await CloudStream.DeleteFile("gmpublish.gma", APPID, steamClient);
+                        AddonInfo addonInfo;
 
-                    var baseFolder = "./Addon";
-                    var gmaPath = "./addon.gma"; //Path.GetTempFileName();
-
-                    var addonJsonPath = Path.Combine(baseFolder, "addon.json");
-                    if (!File.Exists(addonJsonPath)) { throw new Exception("No addon.json file found in specified folder"); }
-                    AddonJSON addon;
-                    using (FileStream addonStream = new FileStream(addonJsonPath, FileMode.Open))
-                    {
-                        addon = addonStream.CreateFromJsonStream<AddonJSON>();
-                    }
-                    if (addon.Icon == "") { throw new Exception("No icon file specified"); }
-                    using (Stream gmaStream = new FileStream(gmaPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
-                    {
-
-                        GMADCreator.Create(baseFolder, addon, gmaStream);
-                        gmaStream.Seek(0, SeekOrigin.Begin);
-
-
-                        using (var icon = new FileStream(Path.Combine(baseFolder, addon.Icon), FileMode.Open))
+                        using (Stream gmaStream = gmaFile.OpenRead())
                         {
-                            var hash = SHAHash(icon);
-                            var iconSuccess = await CloudStream.UploadStream("gmpublish_icon.jpg", APPID, hash, icon.Length, steamClient, icon);
-                            if (!iconSuccess) { Console.WriteLine("JPG Upload failed"); return; }
+                            addonInfo = GetAddonInfoFromGMAFile(gmaStream);
+                            gmaStream.Seek(0, SeekOrigin.Begin);
+
+                            using (Stream iconStream = iconFile.OpenRead())
+                            {
+                                await UploadIcon(iconStream);
+                            }
+
+                            await UploadAddonGMA(gmaStream);
                         }
 
-                        var lzmaStream = LZMAEncodeStream.CompressStreamLZMA(gmaStream);
-                        var hashGma = SHAHash(lzmaStream);
-                        var gmaSuccess = await CloudStream.UploadStream("gmpublish.gma", APPID, hashGma, lzmaStream.Length, steamClient, lzmaStream);
-                        if (!gmaSuccess) { Console.WriteLine("GMA Upload failed"); return; }
-                    }
+                        var publishService = steamUnifiedMessages.CreateService<IPublishedFile>();
 
-                    var publishService = steamUnifiedMessages.CreateService<IPublishedFile>();
-                    if (addon.WorkshopID == 0)
-                    {
-                        var request = new CPublishedFile_Publish_Request
+                        if (currentAction == Action.CREATE)
                         {
-                            appid = APPID,
-                            consumer_appid = APPID,
-                            cloudfilename = "gmpublish.gma",
-                            preview_cloudfilename = "gmpublish_icon.jpg",
-                            title = addon.Title,
-                            file_description = addon.Description,
-                            file_type = (uint)EWorkshopFileType.Community,
-                            visibility = (uint)EPublishedFileVisibility.Public,
-                            collection_type = addon.Type,
-                        };
-                        foreach (var tag in addon.Tags) { request.tags.Add(tag); }
+                            var request = new CPublishedFile_Publish_Request
+                            {
+                                appid = APPID,
+                                consumer_appid = APPID,
+                                cloudfilename = "gmpublish.gma",
+                                preview_cloudfilename = "gmpublish_icon.jpg",
+                                title = addonInfo.title,
+                                file_description = addonInfo.description.Description,
+                                file_type = (uint)EWorkshopFileType.Community,
+                                visibility = (uint)EPublishedFileVisibility.Public,
+                                collection_type = addonInfo.description.Type,
+                            };
+                            foreach (var tag in addonInfo.description.Tags) { request.tags.Add(tag); }
 
-                        var publishCallback = await publishService.SendMessage(publish => publish.Publish(request));
-                        var publishResponse = publishCallback.GetDeserializedResponse<CPublishedFile_Publish_Response>();
-                        addon.WorkshopID = publishResponse.publishedfileid;
+                            var publishCallback = await publishService.SendMessage(publish => publish.Publish(request));
+                            var publishResponse = publishCallback.GetDeserializedResponse<CPublishedFile_Publish_Response>();
+                            var newId = publishResponse.publishedfileid;
 
-                        using (FileStream addonStream = new FileStream(addonJsonPath, FileMode.Create))
-                        {
-                            addonStream.WriteObjectToStreamJson(addon);
+                            Console.WriteLine("NEW PUBLISHED ID: " + newId + ". Wrote to addon.json");
                         }
-                        Console.WriteLine("NEW PUBLISHED ID: " + publishResponse.publishedfileid + ". Wrote to addon.json");
-                    }
-                    else
-                    {
-                        var request = new CPublishedFile_Update_Request
+                        else
                         {
-                            image_height = 512,
-                            image_width = 512,
-                            publishedfileid = addon.WorkshopID,
-                            appid = APPID,
-                            filename = "gmpublish.gma",
-                            preview_filename = "gmpublish_icon.jpg",
-                            title = addon.Title,
-                            file_description = addon.Description,
-                            visibility = (uint)EPublishedFileVisibility.Public,
-                        };
-                        foreach (var tag in addon.Tags) { request.tags.Add(tag); }
+                            var request = new CPublishedFile_Update_Request
+                            {
+                                image_height = 512,
+                                image_width = 512,
+                                publishedfileid = (ulong)workshopId,
+                                appid = APPID,
+                                filename = "gmpublish.gma",
+                                preview_filename = "gmpublish_icon.jpg",
+                                title = addonInfo.title,
+                                file_description = addonInfo.description.Description,
+                                visibility = (uint)EPublishedFileVisibility.Public,
+                            };
+                            foreach (var tag in addonInfo.description.Tags) { request.tags.Add(tag); }
 
-                        var updateCallback = await publishService.SendMessage(publish => publish.Update(request));
-                        var updateResponse = updateCallback.GetDeserializedResponse<CPublishedFile_Update_Response>();
-                        
-                        Console.WriteLine("Addon has been updated");
+                            var updateCallback = await publishService.SendMessage(publish => publish.Update(request));
+                            var updateResponse = updateCallback.GetDeserializedResponse<CPublishedFile_Update_Response>();
+
+                            Console.WriteLine("Addon has been updated");
+                        }
+
                     }
                 }
                 catch (Exception ex)
