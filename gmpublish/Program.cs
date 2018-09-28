@@ -26,8 +26,8 @@ namespace GMPublish
         static bool isRunning;
 
         // Authentication shit
-        static string user, pass;
-        static string authCode, twoFactorAuth;
+        private static string user, pass;
+        //static string authCode, twoFactorAuth;
         static Action currentAction;
 
         // The type of actions i.e gmpublish create -addon some.gma -icon i.jpg => CREATE command
@@ -49,14 +49,28 @@ namespace GMPublish
         public static void Main(string[] args)
         {
 
-            //if (args.Length < 2)
-            //{
-            //    Console.WriteLine("GMPublish: No username and password specified!");
-            //    return;
-            //}
+            if (args.Length < 1)
+            {
+                Console.WriteLine("GMPublish: You need to pass at least one agument!");
+                return;
+            }
 
-            //user = args[0];
-            //pass = args[1];
+            // Get the user and pass from the args if they are set. 
+            // The can be passed via args or via environment variables
+            user = FindArgumentValue("-user", args, false);
+            pass = FindArgumentValue("-pass", args, false);
+
+            if(user == null)
+                user = Environment.GetEnvironmentVariable("GMPUBLISH_USER");
+
+            if (pass == null)
+                pass = Environment.GetEnvironmentVariable("GMPUBLISH_PASS");
+
+            if(user == null || pass == null){
+                Console.WriteLine("GMPublish: You must pass a username and password via the -user and -pass arguments OR via the GMPUBLISH_USER and GMPUBLISH_PASS environment variables.");
+                Exit(8);
+                return;
+            }
 
             string gmaFilePath, iconFilePath;
             switch (args[0]) {
@@ -151,9 +165,10 @@ namespace GMPublish
 
         static AddonInfo GetAddonInfoFromGMAFile(Stream gmaStream){
             AddonInfo addonInfo;
-            using (BinaryReader binaryReader = new BinaryReader(gmaStream)){
+            using (BinaryReader binaryReader = new BinaryReader(gmaStream))
+            using (gmaStream){
                 // Skip past the first part of the gma header to get to the title and description the first entry sizes are 4, 1, 8, 8, 1, then title and description
-                gmaStream.Seek(23, SeekOrigin.Begin);
+                gmaStream.Seek(22, SeekOrigin.Begin);
 
                 addonInfo.title = binaryReader.ReadNullTerminatedString();
                 addonInfo.description = JsonConvert.DeserializeObject<DescriptionJSON>(binaryReader.ReadNullTerminatedString());
@@ -205,14 +220,16 @@ namespace GMPublish
                         await CloudStream.DeleteFile("gmpublish.gma", APPID, steamClient);
                         AddonInfo addonInfo;
 
+                        addonInfo = GetAddonInfoFromGMAFile(gmaFile.OpenRead());
+
                         using (Stream gmaStream = gmaFile.OpenRead())
                         {
-                            addonInfo = GetAddonInfoFromGMAFile(gmaStream);
-                            gmaStream.Seek(0, SeekOrigin.Begin);
-
-                            using (Stream iconStream = iconFile.OpenRead())
-                            {
-                                await UploadIcon(iconStream);
+                            // for updates the icon file is optional
+                            if(iconFile != null && iconFile.Exists){
+                                using (Stream iconStream = iconFile.OpenRead())
+                                {
+                                    await UploadIcon(iconStream);
+                                }
                             }
 
                             await UploadAddonGMA(gmaStream);
@@ -222,6 +239,8 @@ namespace GMPublish
 
                         if (currentAction == Action.CREATE)
                         {
+                            Console.WriteLine("Creating new addon - " + addonInfo.title);
+
                             var request = new CPublishedFile_Publish_Request
                             {
                                 appid = APPID,
@@ -239,37 +258,65 @@ namespace GMPublish
                             var publishCallback = await publishService.SendMessage(publish => publish.Publish(request));
                             var publishResponse = publishCallback.GetDeserializedResponse<CPublishedFile_Publish_Response>();
                             var newId = publishResponse.publishedfileid;
-
-                            Console.WriteLine("NEW PUBLISHED ID: " + newId + ". Wrote to addon.json");
+                            Console.WriteLine(publishResponse.redirect_uri);
+                            Console.WriteLine("Success! New Addon Published. Addon ID: " + newId.ToString());
+                            Exit(1); // 1 signals success in the original gmpublish
                         }
-                        else
+                        else // currentAction == Action.UPDATE
                         {
+                            Console.WriteLine("Updating existing addon " + workshopId + " - " + addonInfo.title);
                             var request = new CPublishedFile_Update_Request
                             {
-                                image_height = 512,
-                                image_width = 512,
                                 publishedfileid = (ulong)workshopId,
                                 appid = APPID,
                                 filename = "gmpublish.gma",
-                                preview_filename = "gmpublish_icon.jpg",
                                 title = addonInfo.title,
                                 file_description = addonInfo.description.Description,
                                 visibility = (uint)EPublishedFileVisibility.Public,
                             };
                             foreach (var tag in addonInfo.description.Tags) { request.tags.Add(tag); }
 
+                            // only update the icon if one was supplied
+                            if(iconFile != null && iconFile.Exists){
+                                request.image_height = 512;
+                                request.image_width = 512;
+                                request.preview_filename = "gmpublish_icon.jpg";
+                            }
+
                             var updateCallback = await publishService.SendMessage(publish => publish.Update(request));
                             var updateResponse = updateCallback.GetDeserializedResponse<CPublishedFile_Update_Response>();
 
-                            Console.WriteLine("Addon has been updated");
+                            
+                            Console.WriteLine("Success! Addon " + workshopId + " has been updated");
+                            Exit(1); // 1 signals success in the original gmpublish
                         }
 
+                    } else if(currentAction == Action.LIST) {
+                        var publishService = steamUnifiedMessages.CreateService<IPublishedFile>();
+
+                        var request = new CPublishedFile_GetUserFiles_Request
+                        {
+                            appid = APPID,
+                            ids_only = false,
+                            steamid = steamClient.SteamID.ConvertToUInt64()
+                            
+                        };
+
+                        Console.WriteLine("Getting published files...\n");
+
+                        var listCallback = await publishService.SendMessage(publish => publish.GetUserFiles(request));
+                        var listResponse = listCallback.GetDeserializedResponse<CPublishedFile_GetUserFiles_Response>();
+                        Console.WriteLine("Found " + listResponse.total.ToString() + " results");
+                        listResponse.publishedfiledetails.ForEach( publishedFile =>
+                            Console.WriteLine(String.Format("\t{0}\t{1,-5:F1} MB \"{2}\" ", publishedFile.publishedfileid, publishedFile.file_size / 1000000f, publishedFile.title))
+                        );
+                        Exit(1); // 1 signals success in the original gmpublish
                     }
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine(ex);
-                    Console.ReadKey();
+                    Exit(2);
                 }
             });
             task.Wait();
@@ -303,14 +350,6 @@ namespace GMPublish
                 Username = user,
                 Password = pass,
 
-                // in this sample, we pass in an additional authcode
-                // this value will be null (which is the default) for our first logon attempt
-                AuthCode = authCode,
-
-                // if the account is using 2-factor auth, we'll provide the two factor code instead
-                // this will also be null on our first logon attempt
-                TwoFactorCode = twoFactorAuth,
-
                 // our subsequent logons use the hash of the sentry file as proof of ownership of the file
                 // this will also be null for our first (no authcode) and second (authcode only) logon attempts
                 SentryFileHash = sentryHash,
@@ -318,14 +357,7 @@ namespace GMPublish
         }
         static void OnDisconnected(SteamClient.DisconnectedCallback callback)
         {
-            // after recieving an AccountLogonDenied, we'll be disconnected from steam
-            // so after we read an authcode from the user, we need to reconnect to begin the logon flow again
-
-            Console.WriteLine("Disconnected from Steam, reconnecting in 5...");
-
-            Thread.Sleep(TimeSpan.FromSeconds(5));
-
-            steamClient.Connect();
+            Console.WriteLine("Disconnected from Steam. Unable to continue");
         }
 
         static void OnLoggedOn(SteamUser.LoggedOnCallback callback)
@@ -335,19 +367,8 @@ namespace GMPublish
 
             if (isSteamGuard || is2FA)
             {
-                Console.WriteLine("This account is SteamGuard protected!");
-
-                if (is2FA)
-                {
-                    Console.Write("Please enter your 2 factor auth code from your authenticator app: ");
-                    twoFactorAuth = Console.ReadLine();
-                }
-                else
-                {
-                    Console.Write("Please enter the auth code sent to the email at {0}: ", callback.EmailDomain);
-                    authCode = Console.ReadLine();
-                }
-
+                Console.WriteLine("This account is SteamGuard protected! This tool is intended to be used for automating workshop uploads and therefore requires an account with steamguard disabled.");
+                Exit(63);
                 return;
             }
 
